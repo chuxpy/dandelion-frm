@@ -10,7 +10,7 @@ Sky signal -> Receivers
 Receivers+RHTimestamp+AntennaID -> Array
 '''
 
-import rtlsdr, datetime, itertools, multiprocessing, tables, sys, time
+import rtlsdr, datetime, itertools, multiprocessing, tables, sys, time, os
 
 sec, hz = 1.0, 2**20
 sample_size = int(sec*hz)
@@ -45,9 +45,12 @@ class receiver(object):
     def initiate_hdf5(self):
         '''Initiates a HDF5 file with the appropriate metadata, and returns a table/array object for writing individual observations (row operations).'''
         now = datetime.datetime.utcnow()
-        h5file = tables.openFile('%s-%s-%s.hd5'%(now.year, now.month, now.day), mode='w', title='Dandelion observation file: UTC-ISO: %s' % (datetime.datetime.isoformat(now)))
+        suffix = 0
+        while os.path.isfile('%s-%s-%s-%sh%sm%s.hd5' % (now.year, now.month, now.day, now.hour, now.minute, '_%s' % suffix)): suffix+=1
+        h5file = tables.openFile('%s-%s-%s-%sh%sm%s.hd5' % (now.year, now.month, now.day, now.hour, now.minute, '_%s' % suffix), mode='w', title='Dandelion observation file: UTC-ISO: %s' % (datetime.datetime.isoformat(now)))
         group = h5file.createGroup('/', 'detector', 'Detector information')
         table = h5file.createTable(group, 'readout', sample, 'Readout')
+        table.cols.utcendtime.createCSIndex()
         return table
     def row_write(self, table, rtl_num, data, timestamp):
         '''Writes a row of data to a HDF5 table/array object.'''
@@ -80,8 +83,11 @@ def start(length=0, time_limit=0): #stop when length or time limit reached.
                     if t > time_limit:
                         sys.exit('%s seconds passed since start time. :) Halted because of time limit.' % t)
     except SystemExit, exc:
-        print exc
-        sys.exit()
+        try:
+            table.reIndex()
+        finally:
+            print exc
+            sys.exit()
 
 class correlator(object):
     '''Definition: the correlator has a function that is separated from the receiving logic. It can be executed separately.
@@ -89,3 +95,35 @@ class correlator(object):
     at fractional delays as defined by the correlation function peak.
     It also uses the measured timestamps (accurate to a millisecond) to calculate the U and V of each baseline, and records it in the MIRIAD
     format for viewing with AIPY.'''
+    def read_hdf5(self, filename):
+        h5file = tables.openFile(filename, 'r')
+        return h5file.root.detector.readout
+    def corr_loop_find(self, parent_num, utcendtime, tbl, quality):
+        min_overlap = quality*sec
+        for num, row in enumerate(tbl.itersorted(tbl.cols.utcendtime, start=parent_num+1), start=parent_num+1):
+            if row[1] > (utcendtime + min_overlap): return num
+            else: continue
+        return parent_num+1
+
+def progress(msg):
+    print msg
+
+def correlate(filename, quality=0.5): #quality denotes the minimum permissible overlap between two samples
+    assert quality <= 1.0+1e-21, "The quality of correlation cannot be over 100%."
+    c = correlator()
+    tbl = c.read_hdf5(filename)
+    for num, row in enumerate(tbl.itersorted(tbl.cols.utcendtime)):
+        min_overlap = quality*sec
+        stop_row = False
+        iterated = enumerate(tbl.itersorted(tbl.cols.utcendtime, start=num, stop=tbl.nrows), start=num)
+        try:
+            anum = False
+            anum, arow = iterated.next()
+            while not arow[1] > (row[1] + min_overlap):
+                anum, arow = iterated.next()
+        except StopIteration:
+            anum = num+1 #this still might not work. please keep working on this, and diagnose possible StopIteration issues
+        all_row_indices = range(num, anum)
+        print '%s: %s. %s' %(num, all_row_indices, row[1]) #this is not part of final
+
+correlate('2012-9-30-22h19m_0.hd5')
