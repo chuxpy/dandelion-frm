@@ -10,7 +10,7 @@ Sky signal -> Receivers
 Receivers+RHTimestamp+AntennaID -> Array
 '''
 
-import rtlsdr, datetime, itertools, multiprocessing, tables, sys, time, os
+import rtlsdr, datetime, itertools, multiprocessing, tables, sys, time, os, math
 
 sec, hz = 1.0, 2**20
 sample_size = int(sec*hz)
@@ -19,7 +19,7 @@ sample_size = int(sec*hz)
 class sample(tables.IsDescription):
     id = tables.Int32Col(pos=0) #antenna ID
     utcendtime = tables.Time64Col(pos=1) #accurate to milliseconds
-    data = tables.Float64Col(shape=sample_size, pos=3) #the actual data from (utcendtime-sec) to (utcendtime) with a step of hz.
+    data = tables.Float64Col(shape=sample_size, pos=2) #the actual data from (utcendtime-sec) to (utcendtime) with a step of hz.
 
 def process_receiver(rtl_queue, rtl_num):
     sdr = rtlsdr.RtlSdr(rtl_num)
@@ -105,8 +105,31 @@ class correlator(object):
             else: continue
         return parent_num+1
 
+class GetMeOutofThisLoop(BaseException):
+    pass
+
 def progress(msg):
     print msg
+
+def crop(child_row, parent_row, time_inacc = 5e-3): #5 millisecond inaccuracy assumed
+    child_data, parent_data = child_row['data'], parent_row['data']
+    tdiff = parent_row['utcendtime'] - child_row['utcendtime']
+    inacc = int(time_inacc*hz)
+    offset = int(math.fabs(tdiff) - inacc)
+    if offset < 0: offset = 0
+    if tdiff > 0:
+        child_data = child_data[offset:]
+        parent_data = parent_data[0:len(parent_data)-offset]
+    elif tdiff < 0:
+        child_data = child_data[0:len(child_data)-offset]
+        parent_data = parent_data[offset:]
+    return (child_data, parent_data)
+
+def correlate_for_true_delay(child_row, parent_row):
+    return tdiff
+
+def resample(row, var_delay):
+    return row
 
 def correlate(filename, quality=0.5): #quality denotes the minimum permissible overlap between two samples
     assert quality <= 1.0+1e-21, "The quality of correlation cannot be over 100%."
@@ -114,15 +137,23 @@ def correlate(filename, quality=0.5): #quality denotes the minimum permissible o
     tbl = c.read_hdf5(filename)
     for num, row in enumerate(tbl.itersorted(tbl.cols.utcendtime)):
         min_overlap = quality*sec
-        stop_row = False
         iterated = enumerate(tbl.itersorted(tbl.cols.utcendtime, start=num, stop=tbl.nrows), start=num)
         try:
-            anum = False
             anum, arow = iterated.next()
-            while not arow[1] > (row[1] + min_overlap):
-                anum, arow = iterated.next()
-        except StopIteration:
-            anum = num+1 #this still might not work. please keep working on this, and diagnose possible StopIteration issues
+            while True:
+                if not arow['utcendtime'] > (row['utcendtime'] + min_overlap):
+                    #do all processing and passing here!
+                    child_data, parent_data = crop(arow, row)
+                    child_utcendtime, parent_utcendtime = arow['utcendtime'], row['utcendtime']
+                    child_id, parent_id = arow['id'], row['id']
+                    child_data =
+                    anum, arow = iterated.next()
+                else:
+                    raise GetMeOutofThisLoop
+        except StopIteration: #set stop index pls
+            anum += 1
+        except GetMeOutofThisLoop: #the stop index does not need to be set
+            pass
         all_row_indices = range(num, anum)
         print '%s: %s. %s' %(num, all_row_indices, row[1]) #this is not part of final
 
