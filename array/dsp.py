@@ -11,18 +11,14 @@ import matplotlib.pyplot as plt
 
 def b_filter(order, low, high, sample_rate, filter_type='band'):
     '''Defines a Butterworth bandpass filter defined by args. Applies filter to an input and returns it.
-    btype specifies the type of filter used.'''
+    filter_type specifies the type of filter used.'''
     nyquist = 0.5 * sample_rate
     filter_coeff = [low / nyquist, high / nyquist]
     if filter_type == 'low':
         filter_coeff = [high / nyquist]
     elif filter_type == 'high':
         filter_coeff = [low / nyquist]
-    return scipy.signal.butter(order, filter_coeff, btype=filter_type)
-
-def apply_filter(coeff, data):
-    '''Get coefficients from filter, and filter it up.'''
-    b, a = coeff
+    b, a = scipy.signal.butter(order, filter_coeff, btype=filter_type)
     return scipy.signal.lfilter(b, a, data)
 
 
@@ -57,14 +53,3 @@ def interpolate(delays, twodata):
     newbot = scipy.signal.cspline1d_eval(scipy.signal.cspline1d(bot), inter_x, dx=1.0, x0=0.0)
     return (top[1:], newbot) #now they're perfectly aligned.
 '''Next feasible step: split the complex and make sure it gets fixed.'''
-
-def shift(delay, data):
-
-
-rtl = rtlsdr.RtlSdr(0)
-rtl.sample_rate = 2 ** 20
-rtl.center_freq = 1.4208e9
-rtl.gain = 1.0
-data = rtl.read_samples(2 ** 20)
-filtered = apply_filter(b_filter(5, 0.0, 1e5, 2 ** 20, 'low'), data)
-figures(data, filtered)
