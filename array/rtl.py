@@ -10,11 +10,14 @@ Sky signal -> Receivers
 Receivers+RHTimestamp+AntennaID -> Array
 '''
 
-import rtlsdr, datetime, itertools, multiprocessing, tables, sys, time, os, math, scipy, numpy, scipy.signal, scipy.fftpack, scipy.stats
+import rtlsdr, datetime, itertools, multiprocessing, tables, sys, time, os, math, scipy, numpy, scipy.signal, scipy.fftpack, scipy.stats, matplotlib.pyplot as plt, ephem
+from numexpr import evaluate
 
 sec, hz = 1.0, 2**20
 sample_size = int(sec*hz)
-center_freq = 1.4208e9
+interest_freq = 1.4208e9
+dc_width = 1.0e5
+center_freq = interest_freq - dc_width
 
 #metadata; info = tables.Float32Col(shape=3) #essential data for interpretation and shifting of samples: (sample_rate[hz], length[sec])
 class sample(tables.IsDescription):
@@ -24,33 +27,41 @@ class sample(tables.IsDescription):
 
 class metadata(tables.IsDescription):
     id = tables.Int32Col(pos=0) #antenna ID
-    position = tables.Float64Col(shape=2, pos=1) #latitude, longitude
-    samplesize = tables.Int64Col(pos=2)
-    integrationtime = tables.Float64Col(pos=3)
-    sps = tables.Float64Col(pos=4)
-    centerfreq = tables.Float64Col(pos=4)
+    position = tables.Float64Col(shape=2, pos=1) #from zero
 
-def process_receiver(rtl_queue, rtl_num):
-    sdr = rtlsdr.RtlSdr(rtl_num)
+class fringe(tables.IsDescription):
+    id = tables.Int32Col(shape=2, pos=0) #antenna IDs (baseline)
+    omega = tables.Float64Col(pos=1)
+    xcoeff = tables.Float64Col(pos=2)
+    ycoeff = tables.Float64Col(pos=3)
+    zscore = tables.Float64Col(pos=4)
+    utcmidtime = tables.Time64Col(pos=5)
+
+def process_receiver(rtl_queue, sdr, rtl_num, gain, highfreq):
+    print "* %s process spawned" % rtl_num
     sdr.sample_rate = hz
     sdr.center_freq = center_freq
-    sdr.gain = 1
+    sdr.gain = gain
     while True:
         data = sdr.read_samples(sample_size)
-        rtl_queue.put({'Receiver': rtl_num, 'Timestamp': time.time(), 'Data': data})
+        fdata = numpy.abs(b_filter(data, dc_width, highfreq, hz, filter_type='band'))
+        rtl_queue.put({'Receiver': rtl_num, 'Timestamp': time.time(), 'Data': fdata})
 
 class receiver(object):
     '''Builds and operates the RTL data input circuit.'''
-    def __init__(self, rtl_list=[0]):
+    def __init__(self, rtl_list=[0], gain=10, highfreq=dc_width+100e3):
         self.rtl_list = rtl_list
         self.pairs = list(itertools.combinations(self.rtl_list, 2))
         self.rtl_queue = {key: None for key in self.rtl_list}
         self.rtl_pos = {key: None for key in self.rtl_list}
+        self.rtl_rcvrs = {key: None for key in self.rtl_list}
         for receiver_num in self.rtl_list:
             self.rtl_queue[receiver_num] = multiprocessing.Queue()
-            pos_string = raw_input("Please plug in receiver #%s and type in its position x,y as two floats separated by a comma." % receiver_num)
-            self.rtl_pos[receiver_num] = tuple([float(num.strip()) for num in pos_string.split(",")][0:1])
-            p = multiprocessing.Process(target=process_receiver, args=(self.rtl_queue[receiver_num], receiver_num)) #1st arg to process_receiver() is `self`.
+            pos_string = raw_input("Plug in receiver #%s and type in its position x,y in wavelengths. " % receiver_num)
+            self.rtl_pos[receiver_num] = tuple([float(num.strip()) for num in pos_string.split(",")][0:2])
+            self.rtl_rcvrs[receiver_num] = rtlsdr.RtlSdr(receiver_num)
+        for receiver_num in self.rtl_list:
+            p = multiprocessing.Process(target=process_receiver, args=(self.rtl_queue[receiver_num], self.rtl_rcvrs[receiver_num], receiver_num, gain, highfreq)) #1st arg to process_receiver() is `self`.
             p.start()
     def get_queue(self):
         return self.rtl_queue
@@ -63,15 +74,16 @@ class receiver(object):
         group = h5file.createGroup('/', 'detector', 'Detector information')
         table = h5file.createTable(group, 'readout', sample, 'Readout')
         table.cols.utcendtime.createCSIndex()
+        h5file.root._v_attrs.samplesize = sample_size
+        h5file.root._v_attrs.integrationtime = sec
+        h5file.root._v_attrs.sps = hz
+        h5file.root._v_attrs.centerfreq = center_freq
+        h5file.root._v_attrs.latlong = numpy.array([raw_input('Latitude in degrees: '), raw_input('Longitude in degrees: ')])
         metatable = h5file.createTable(group, 'metadata', metadata, 'Metadata')
         for k in self.rtl_pos:
             row = metatable.row
             row['id'] = k
             row['position'] = self.rtl_pos[k]
-            row['samplesize'] = sample_size
-            row['integrationtime'] = sec
-            row['sps'] = hz
-            row['centerfreq'] = center_freq
             row.append()
             metatable.flush()
         return table
@@ -80,17 +92,15 @@ class receiver(object):
         row = table.row
         row['id'] = rtl_num
         row['utcendtime'] = timestamp
-        #row['re'], row['im'] = numpy.array([num.real for num in data]), numpy.array([num.imag for num in data])
-        #row['data'] = [numpy.sqrt(num.real**2 + num.imag**2) for num in data] #this line does not work
-        row['data'] = numpy.abs(data) #is this equivalent?
+        row['data'] = data
         row.append()
         table.flush()
 
-def start(length=0, time_limit=0): #stop when length or time limit reached.
+def start(length=0, time_limit=0, gain=10, highfreq=hz/2): #stop when length or time limit reached.
     length = int(length)
     current_length = 0
-    sources = [0,1,2]
-    rc = receiver(sources)
+    sources = [int(x) for x in raw_input("Please list the rtl_ids of your receivers: ").split(",")]
+    rc = receiver(sources, gain, highfreq)
     queue = rc.get_queue()
     table = rc.initiate_hdf5()
     start_time = time.time()
@@ -114,85 +124,6 @@ def start(length=0, time_limit=0): #stop when length or time limit reached.
             print exc
             sys.exit()
 
-class correlator(object):
-    '''Definition: the correlator has a function that is separated from the receiving logic. It can be executed separately.
-    The correlator works by arbitrarily cropping samples and finding their correlation peak, then shifting them and resampling them appropriately
-    at fractional delays as defined by the correlation function peak.
-    It also uses the measured timestamps (accurate to a millisecond) to calculate the U and V of each baseline, and records it in the MIRIAD
-    format for viewing with AIPY.'''
-    def read_hdf5(self, filename):
-        h5file = tables.openFile(filename, 'r')
-        return (h5file.root.detector.readout, h5file.root.detector.metadata)
-    def corr_loop_find(self, parent_num, utcendtime, tbl, quality):
-        min_overlap = quality*sec
-        for num, row in enumerate(tbl.itersorted(tbl.cols.utcendtime, start=parent_num+1), start=parent_num+1):
-            if row[1] > (utcendtime + min_overlap): return num
-            else: continue
-        return parent_num+1
-
-class GetMeOutofThisLoop(BaseException):
-    pass
-
-def progress(msg):
-    print msg
-
-def crop(child_row, parent_row, time_inacc = 5e-3): #5 millisecond inaccuracy assumed
-    child_data, parent_data = child_row['data'], parent_row['data']
-    tdiff = parent_row['utcendtime'] - child_row['utcendtime']
-    inacc = int(time_inacc*hz)
-    offset = int(math.fabs(tdiff) - inacc)
-    if offset < 0: offset = 0
-    if tdiff > 0:
-        child_data = child_data[offset:]
-        parent_data = parent_data[0:len(parent_data)-offset]
-    elif tdiff < 0:
-        child_data = child_data[0:len(child_data)-offset]
-        parent_data = parent_data[offset:]
-    return (child_data, parent_data)
-
-def correlate_for_true_delay(child_row, parent_row, time_inacc = 5e-3):
-    '''The time delay of two signals is given by the arg max of its correlation function. Takes the two rows and returns a normalized time delay.
-    Since convolution is similar to but not identical to correlation, it should yield a correct result.
-    
-    Do an argmax supported by a "pinpointing" and yield a tdiff that is close to the expected tdiff value.'''
-    #look at:
-    #numpy.argmax() - get index of peak
-    child_fft = scipy.fftpack.fft(child_row['data'])
-    parent_fft = scipy.fftpack.fft(parent_row['data'])
-    child_inverse_conjugate = -child_fft.conjugate()
-    #auto_child = numpy.abs(scipy.fftpack.ifft(child_fft*child_inverse_conjugate)) # as per http://hebb.mit.edu/courses/9.29/2002/readings/c13-2.pdf , check for 0's and eliminate them
-    #convolution = numpy.abs(scipy.fftpack.ifft(parent_fft*child_inverse_conjugate))
-    fft_auto_child = child_fft*child_inverse_conjugate # as per http://hebb.mit.edu/courses/9.29/2002/readings/c13-2.pdf , check for 0's and eliminate them
-    fft_convolution = parent_fft*child_inverse_conjugate
-    convolution_spectrum = numpy.abs(scipy.fftpack.ifft(fft_convolution/fft_auto_child)) #Roth window
-    #we're having troubles actually dealing with the whole convolution spectrum - crop it to several milliseconds from where we think it ought to be to find an accurate tdiff.
-    assert time_inacc < sec/2, "This system clock cannot *possibly* be that inaccurate!"
-    expected_tdiff = int((child_row['utcendtime']-parent_row['utcendtime'])*hz) #our initial guess for the location of the tdiff peak
-    sample_inacc = int(time_inacc*hz) #around the guessed place of tdiff.
-    if expected_tdiff-sample_inacc < 0: expected_tdiff = sample_inacc
-    elif expected_tdiff+sample_inacc > sample_size: expected_tdiff = sample_size-sample_inacc
-    cropped_convolution_spectrum = convolution_spectrum[expected_tdiff-sample_inacc:expected_tdiff+sample_inacc]
-    #later measurements of tdiff will have a 0 point at expected_tdiff-sample_inacc and a total length of around 2*sample_inacc (may wrap around)
-    tdiff = numpy.argmax(cropped_convolution_spectrum)
-    tdiff += expected_tdiff-sample_inacc #check the other case that it wrapped around..?
-    zscore = (convolution_spectrum[tdiff]-numpy.average(convolution_spectrum))/numpy.std(convolution_spectrum)
-    #timespan = math.fabs(child_row['utcendtime'] - parent_row['utcendtime']) + sec
-    expected_overlap = (float(sec) - 1.0*math.fabs(child_row['utcendtime']-parent_row['utcendtime']))*hz
-    real_overlap = (float(sec) - 1.0*math.fabs(float(tdiff)/hz))*hz
-    logmsg = '(%s,%s)| peak: (%s,%s), error: %s s, real: %s, expected: %s, z-score: %s'
-    print  logmsg %(parent_row['id'],
-                    child_row['id'],
-                    tdiff,
-                    convolution_spectrum[tdiff],
-                    (float(tdiff)/hz-1.0*(child_row['utcendtime']-parent_row['utcendtime'])),
-                    real_overlap,
-                    expected_overlap,
-                    round(zscore,3))
-    return tdiff
-
-def resample(row, var_delay):
-    return (row, true_crop_dist)
-
 def b_filter(data, low, high, sample_rate, order=3, filter_type='band'):
     '''Defines a Butterworth bandpass filter defined by args. Applies filter to an input and returns it.
     filter_type specifies the type of filter used.'''
@@ -205,43 +136,149 @@ def b_filter(data, low, high, sample_rate, order=3, filter_type='band'):
     b, a = scipy.signal.butter(order, filter_coeff, btype=filter_type)
     return scipy.signal.lfilter(b, a, data)
 
-def get_uv_rate(timearray, rtlids):
-    pass
+class correlator(object):
+    def __init__(self):
+        self.obs_site = ephem.Observer()
+        self.secs_in_sidereal_day = 86164.09054 #wolframalpha
+        self.quality = 0.5
+        self.time_inacc = 1e-2
+    def read_hdf5(self, filename):
+        self.h5file = tables.openFile(filename, 'r')
+        self.filename = filename
+        self.samplesize = self.h5file.root._v_attrs.samplesize #automatically read metadata and load it
+        self.integrationtime = self.h5file.root._v_attrs.integrationtime
+        self.sps = self.h5file.root._v_attrs.sps
+        self.centerfreq = self.h5file.root._v_attrs.centerfreq
+        self.latlong = self.h5file.root._v_attrs.latlong
+        self.obs_site.lat, self.obs_site.long = [str(attribute) for attribute in self.latlong] #continue setting up obs_site for sidereal stuff
+        self.detector_pos = {}
+        self.parent_row, self.child_row = {}, {}
+        for row in self.h5file.root.detector.metadata:
+            self.detector_pos[row['id']] = row['position']
+    def next_row(self):
+        for num, row in enumerate(self.h5file.root.detector.readout.itersorted(self.h5file.root.detector.readout.cols.utcendtime)):
+            min_overlap = self.quality*self.integrationtime
+            self.parent_row = {'data': row['data'],
+                               'utcendtime': row['utcendtime'],
+                               'id': row['id']}
+            for anum, arow in enumerate(self.h5file.root.detector.readout.itersorted(self.h5file.root.detector.readout.cols.utcendtime, start=num+1, stop=self.h5file.root.detector.readout.nrows), start=num+1):
+                    if not arow['utcendtime'] > (row['utcendtime'] + min_overlap):
+                        self.child_row = {'data': arow['data'],
+                                          'utcendtime': arow['utcendtime'],
+                                          'id': arow['id']}
+                    else: break
+                    yield ((num, anum),(self.parent_row['id'],self.child_row['id']))
+    def initiate_hdf5(self, h5class = fringe):
+        '''Initiates a HDF5 file and returns a table corresponding to a number of fringe-rate map lines.'''
+        suffix = 0
+        now = datetime.datetime.utcnow()
+        while os.path.isfile('dFRM_%s%s.hd5' % (self.filename[0:len(self.filename)-4], '_%s' % suffix)): suffix+=1
+        h5file = tables.openFile('dFRM_%s%s.hd5' % (self.filename[0:len(self.filename)-4], '_%s' % suffix), mode='w', title='Dandelion fringe rate mapping file: UTC-ISO: %s' % (datetime.datetime.isoformat(now)))
+        group = h5file.createGroup('/', 'correlator', 'Correlated information')
+        self.save_table = h5file.createTable(group, 'readout', h5class, 'Readout')
+        self.save_table.cols.utcmidtime.createCSIndex()
+    def correlate(self):
+        '''Estimates the time-delay in whole samples, then aligns and finds the complex visibility for two signals in the data key of self.parent_row and self.child_row.
+        Generates self.convolution_spectrum, self.zscore, self.expected_overlap, and self.real_overlap, which can be used for plotting purposes.
+        Creates two signals, one corresponding to the cos and the other to the sin signal, as self.cos_signal and self.sin_signal
+        In order to do a correlation without opening a file and populating self.child_row and self.parent_row, assign these variables manually.'''
+        child_fft = scipy.fftpack.fft(self.child_row['data'])
+        parent_fft = scipy.fftpack.fft(self.parent_row['data'])
+        child_inverse_conjugate = -child_fft.conjugate()
+        fft_auto_child = child_fft*child_inverse_conjugate
+        fft_convolution = parent_fft*child_inverse_conjugate
+        self.convolution_spectrum = numpy.abs(scipy.fftpack.ifft(fft_convolution/fft_auto_child)) #Roth window saved in self.convolution_spectrum
+        assert self.time_inacc < sec/2, "This system clock cannot *possibly* be that inaccurate!"
+        expected_tdiff = int((self.child_row['utcendtime']-self.parent_row['utcendtime'])*hz) #our initial guess for the location of the tdiff peak
+        sample_inacc = int(self.time_inacc*hz) #around the guessed place of tdiff.
+        if expected_tdiff-sample_inacc < 0: expected_tdiff = sample_inacc
+        elif expected_tdiff+sample_inacc > sample_size: expected_tdiff = sample_size-sample_inacc
+        cropped_convolution_spectrum = self.convolution_spectrum[expected_tdiff-sample_inacc:expected_tdiff+sample_inacc]
+        #later measurements of tdiff will have a 0 point at expected_tdiff-sample_inacc and a total length of around 2*sample_inacc (may wrap around)
+        tdiff = numpy.argmax(cropped_convolution_spectrum)
+        tdiff += expected_tdiff-sample_inacc #offset for the real convolution_spectrum
+        self.zscore = (self.convolution_spectrum[tdiff]-numpy.average(self.convolution_spectrum))/numpy.std(self.convolution_spectrum)
+        #timespan = math.fabs(child_row['utcendtime'] - parent_row['utcendtime']) + sec
+        self.expected_overlap = (float(sec) - 1.0*math.fabs(self.child_row['utcendtime']-self.parent_row['utcendtime']))*hz
+        self.real_overlap = (float(sec) - 1.0*math.fabs(float(tdiff)/hz))*hz
+        int_delay = int(numpy.copysign(numpy.floor(numpy.fabs(tdiff)), tdiff))
+        self.abs_delay = int(abs(int_delay)) #always positive :)
+        parent_signal, child_signal = self.parent_row['data'][self.abs_delay:], self.child_row['data'][0:len(self.child_row['data'])-self.abs_delay]
+        h_child_length = len(child_signal)
+        h_child_new_length = int(2**numpy.ceil(numpy.log2(h_child_length)))
+        h_child_diff_length = h_child_new_length - h_child_length
+        h_child_signal = scipy.fftpack.hilbert(numpy.append(child_signal, numpy.zeros(h_child_diff_length)))[0:h_child_length]
+        self.cos_signal, self.sin_signal = evaluate("parent_signal*child_signal"), evaluate("h_child_signal*parent_signal")
+    def fringe_rate_map(self, ra, dec):
+        '''Calculates the coefficients for a fringe rate map with the UV Rate and Baseline length for a given timestamp using pyephem.
+        If self.obs_site does not exist already, create it as an ephem.Observer() object and initialize it with lat and long.'''
+        self.utcmidtime = (self.child_row['utcendtime']+self.parent_row['utcendtime']-self.integrationtime)/2.0 # "the middle" timestamp, reduces error from LST
+        self.obs_site.date = datetime.datetime.utcfromtimestamp(self.utcmidtime)
+        local_sidereal_time = self.obs_site.sidereal_time()
+        x, y = self.detector_pos[self.child_row['id']][0]-self.detector_pos[self.parent_row['id']][0], self.detector_pos[self.child_row['id']][1]-self.detector_pos[self.parent_row['id']][1]
+        hour_angle = local_sidereal_time - ephem.hours(str(ra)) #ra should be in hh:mm:ss
+        decl = ephem.degrees(str(dec)) #dec should also be in dd:mm:ss
+        deriv_ha = 2.0*numpy.pi/self.secs_in_sidereal_day
+        self.du = x*numpy.cos(hour_angle)*deriv_ha-y*numpy.sin(hour_angle)*deriv_ha
+        self.dv = x*numpy.sin(decl)*numpy.sin(hour_angle)*deriv_ha+y*numpy.sin(decl)*numpy.cos(hour_angle)*deriv_ha
+        self.complex_visibility = self.cos_signal + 1.0j*self.sin_signal
+        self.complex_visibility = numpy.append(self.complex_visibility,
+                                               numpy.zeros(2**(numpy.ceil(numpy.log2(len(self.complex_visibility))))-len(self.complex_visibility))) #zero-padding for efficiency (2**n)
+        self.fringe_rate_spectrum = scipy.fftpack.fft(self.complex_visibility)
+        self.omega = numpy.argmax(self.fringe_rate_spectrum)
+        self.xcoeff = 2.0*numpy.pi*self.du
+        self.ycoeff = 2.0*numpy.pi*self.dv
+    def save_correlation_spectrum(self):
+        return self.convolution_spectrum
+    def save_complex_vis(self):
+        return self.complex_visibility
+    def save_fringe_rate_spectrum(self):
+        return self.fringe_rate_spectrum
+    def save_frm(self):
+        fringe_fields = ('id','omega','xcoeff','ycoeff','zscore','utcmidtime')
+        return (fringe_fields,
+                ((self.parent_row['id'], self.child_row['id']), self.omega, self.xcoeff, self.ycoeff, self.zscore, self.utcmidtime))
+    def save_data(self):
+        '''Could be extended to save any of the attributes: the correlation spectrum, the complex visibility, and the fringe-rate map.
+        Those attributes are made available already.
+        If save_data wants to use more than the basic save_frm() data, a different pytables class should be passed to initiate_hdf5.'''
+        row = self.save_table.row
+        row_data = self.save_frm()
+        #assert row.nrows == len(row_data)
+        for n in range(len(row_data[0])):
+            row[row_data[0][n]] = row_data[1][n]
+        row.append()
+        self.save_table.flush()
 
 def correlate(filename, quality=0.5): #quality denotes the minimum permissible overlap between two samples
-    assert quality <= 1.0+1e-21, "The quality of correlation cannot be over 100%."
+    assert quality <= 1.0+1e-21, "The quality of crop cannot be over 100%."
     c = correlator()
-    tbl, meta = c.read_hdf5(filename)
-    detector_metadata = {}
-    for row in meta:
-        detector_metadata[row['id']] = {'position': row['position'],
-                                        'samplesize': row['samplesize'],
-                                        'integrationtime': row['integrationtime'],
-                                        'sps': row['sps'],
-                                        'centerfreq': row['centerfreq']}
-    for num, row in enumerate(tbl.itersorted(tbl.cols.utcendtime)):
-        min_overlap = quality*sec
-        iterated = enumerate(tbl.itersorted(tbl.cols.utcendtime, start=num, stop=tbl.nrows), start=num)
-        try:
-            anum, arow = iterated.next()
-            while True:
-                if not arow['utcendtime'] > (row['utcendtime'] + min_overlap):
-                    #do all processing and passing here!
-                    child_dict, parent_dict = {}, {}
-                    #child_dict['data'], parent_dict['data'] = crop(arow, row)
-                    child_dict['data'], parent_dict['data'] = b_filter(arow['data'], 0, 2**19, 2**20, filter_type='low'), b_filter(row['data'], 0, 2**19, 2**20, filter_type='low')
-                    child_dict['utcendtime'], parent_dict['utcendtime'] = arow['utcendtime'], row['utcendtime']
-                    child_dict['id'], parent_dict['id'] = arow['id'], row['id']
-                    var_delay = correlate_for_true_delay(child_dict, parent_dict)
-                    #child_dict['data'], parent_dict['data'] = resample(child_dict['data'], var_delay)
-                    anum, arow = iterated.next()
-                else:
-                    raise GetMeOutofThisLoop
-        except StopIteration: #set stop index pls
-            anum += 1
-        except GetMeOutofThisLoop: #the stop index does not need to be set
-            pass
-        all_row_indices = range(num, anum)
-        #print '%s: %s. %s' %(num, all_row_indices, row[1]) #this is not part of final
+    c.read_hdf5(filename)
+    c.initiate_hdf5(fringe)
+    ra, dec = (raw_input("Right Ascension of the source (hh:mm:ss): "), raw_input("Declination of the source (dd:mm:ss): "))
+    rower = c.next_row()
+    total_rows = c.h5file.root.detector.readout.nrows
+    initial_time = time.time()
+    for indicator in rower:
+        cycle_time = time.time()
+        c.correlate()
+        correlate_time = time.time()
+        #print "  %s seconds for correlate." % (correlate_time-filter_time)
+        c.fringe_rate_map(ra, dec)
+        frm_time = time.time()
+        #print "  %s seconds for frm." % (frm_time-correlate_time)
+        c.save_data()
+        save_time = time.time()
+        total_time = save_time-cycle_time
+        print "Correlated (%s,%s) out of %s for baseline (%s,%s) in %.2f secs. %.2f%% corr, %.2f%% frm" % (indicator[0][0],
+                                                                                                                        indicator[0][1],
+                                                                                                                        total_rows,
+                                                                                                                        indicator[1][0],
+                                                                                                                        indicator[1][1],
+                                                                                                                        total_time,
+                                                                                                                        100.0*(correlate_time-cycle_time)/total_time,
+                                                                                                                        100.0*(frm_time-correlate_time)/total_time)
+    print "Correlation done in %s seconds." % (time.time()-initial_time)
+        
+#rtl.correlate('2012-10-22-6h11m_0.hd5')
 
-#correlate('2012-9-30-22h19m_0.hd5')
